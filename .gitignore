@@ -1,2 +1,3 @@
-shell.c.save
-shell.exe
+.vscode
+*.exe
+shell
