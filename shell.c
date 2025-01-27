@@ -115,6 +115,31 @@ char* get_formatted_cwd(void) {
     return formatted;
 }
 
+char** remove_redirection_args(char** args) {
+    int count = 0;
+    for (int i = 0; args[i] != NULL; i++) {
+        if (strcmp(args[i], "<") == 0 || strcmp(args[i], ">") == 0) {
+            i++; // Skip the redirection operator and filename
+        } else {
+            count++;
+        }
+    }
+
+    char** clean_args = malloc((count + 1) * sizeof(char*));
+    int j = 0;
+    for (int i = 0; args[i] != NULL; i++) {
+        if (strcmp(args[i], "<") == 0 || strcmp(args[i], ">") == 0) {
+            i++; // Skip the redirection operator and filename
+        } else {
+            clean_args[j++] = args[i];
+        }
+    }
+    clean_args[j] = NULL;
+
+    return clean_args;
+}
+
+
 // Main shell interactive loop
 void shell_interactive_loop(void) {
     shell_initialize();
@@ -238,7 +263,7 @@ int process_command(char* command_line) {
     } else if (strcmp(clean_args[0], "exit") == 0) {
         result = shell_exit(clean_args);
     } else if (strcmp(clean_args[0], "ls") == 0) {
-        list_directory(clean_args);
+        result = execute_external_command(clean_args, in_fd, out_fd);
     } else {
         result = execute_external_command(clean_args, in_fd, out_fd);
     }
@@ -276,7 +301,6 @@ char** parse_command(char* line) {
 
 
 
-// Handle I/O redirection
 void handle_io_redirection(char** args, int* in_fd, int* out_fd) {
     for (int i = 0; args[i] != NULL; i++) {
         if (strcmp(args[i], "<") == 0 && args[i + 1] != NULL) {
@@ -297,7 +321,7 @@ void handle_io_redirection(char** args, int* in_fd, int* out_fd) {
     }
 }
 
-// Modified execute_external_command to handle I/O redirection
+// Modified execute_external_command to handle I/O redirection and print output in a new line
 int execute_external_command(char** args, int in_fd, int out_fd) {
     pid_t pid = fork();
 
@@ -327,36 +351,18 @@ int execute_external_command(char** args, int in_fd, int out_fd) {
         do {
             waitpid(pid, &status, WUNTRACED);
         } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+
+        // Print a new line after successful command execution
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            mvprintw(LINES - 1, 0, "\n");
+            refresh();
+        }
     }
 
     return 1;
 }
 
-// Helper functions for I/O redirection
-int count_args(char** args) {
-    int count = 0;
-    while (args[count] != NULL) count++;
-    return count;
-}
-
-char** remove_redirection_args(char** args) {
-    int count = count_args(args);
-    char** clean_args = malloc(sizeof(char*) * (count + 1));
-    int clean_index = 0;
-
-    for (int i = 0; args[i] != NULL; i++) {
-        if (strcmp(args[i], "<") == 0 || strcmp(args[i], ">") == 0) {
-            i++; // Skip the redirection operator and filename
-            continue;
-        }
-        clean_args[clean_index++] = args[i];
-    }
-    clean_args[clean_index] = NULL;
-
-    return clean_args;
-}
-
-
+// Updated handle_cd function to fix snprintf warning
 int handle_cd(char** args) {
     char* home = getenv("HOME");
     char* oldpwd = getenv("OLDPWD");
@@ -432,9 +438,15 @@ int handle_cd(char** args) {
 
     // Construct full path for relative paths
     if (unquoted_path[0] != '/') {
-        snprintf(resolved_path, PATH_MAX, "%s/%s", current, unquoted_path);
+        if (snprintf(resolved_path, PATH_MAX, "%s/%s", current, unquoted_path) >= PATH_MAX) {
+            mvprintw(0, 0, "cd: path too long\n");
+            refresh();
+            free(unquoted_path);
+            return 1;
+        }
     } else {
         strncpy(resolved_path, unquoted_path, PATH_MAX - 1);
+        resolved_path[PATH_MAX - 1] = '\0';
     }
     
     free(unquoted_path);
@@ -454,13 +466,28 @@ int handle_cd(char** args) {
 }
 
 int handle_help(char** args) {
-    mvprintw(0, 0, "Available commands:\n");
-    mvprintw(1, 0, "  cd [directory] [-P]\n");
-    mvprintw(2, 0, "  help\n");
-    mvprintw(3, 0, "  exit\n");
-    mvprintw(4, 0, "  ls [directory]\n");
-    mvprintw(5, 0, "  Custom executables in current directory\n");
-    refresh();
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        // Child process
+        char* help_args[] = {"echo", "Available commands:\n  cd [directory] [-P]\n  help\n  exit\n  ls [directory]\n  Custom executables in current directory\n", NULL};
+        if (execvp(help_args[0], help_args) == -1) {
+            mvprintw(0, 0, "Command execution failed: %s\n", strerror(errno));
+            refresh();
+            exit(EXIT_FAILURE);
+        }
+    } else if (pid < 0) {
+        mvprintw(0, 0, "Fork failed: %s\n", strerror(errno));
+        refresh();
+        return 0;
+    } else {
+        // Parent process
+        int status;
+        do {
+            waitpid(pid, &status, WUNTRACED);
+        } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+    }
+
     return 1;
 }
 
@@ -469,22 +496,27 @@ int shell_exit(char** args) {
 }
 
 void list_directory(char** args) {
-    const char* path = (args[1] == NULL) ? "." : args[1];
-    DIR* dir = opendir(path);
-    if (dir == NULL) {
-        mvprintw(0, 0, "Cannot open directory: %s\n", path);
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        // Child process
+        char* ls_args[] = {"ls", args[1] ? args[1] : ".", NULL};
+        if (execvp(ls_args[0], ls_args) == -1) {
+            mvprintw(0, 0, "Command execution failed: %s\n", strerror(errno));
+            refresh();
+            exit(EXIT_FAILURE);
+        }
+    } else if (pid < 0) {
+        mvprintw(0, 0, "Fork failed: %s\n", strerror(errno));
         refresh();
         return;
+    } else {
+        // Parent process
+        int status;
+        do {
+            waitpid(pid, &status, WUNTRACED);
+        } while (!WIFEXITED(status) && !WIFSIGNALED(status));
     }
-
-    struct dirent* entry;
-    int line = 0;
-    while ((entry = readdir(dir)) != NULL) {
-        mvprintw(line++, 0, "%s\n", entry->d_name);
-    }
-    refresh();
-
-    closedir(dir);
 }
 
 void shell_initialize(void) {
