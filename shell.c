@@ -56,7 +56,7 @@ void shell_terminate(void);
 void shell_interactive_loop(void);
 char* get_formatted_cwd(void);
 char** parse_command(char* line);
-int execute_command(char** args);
+int _command(char** args);
 int handle_cd(char** args);
 int handle_exit(char** args);
 void execute_help_command(void);
@@ -267,7 +267,7 @@ void shell_interactive_loop(void) {
                             execute_help_command();
                         } else {
                             printw("\n");  // New line before command output
-                            execute_command(args);
+                            _command(args);
                         }
                         free(args);
                     }
@@ -443,7 +443,7 @@ char* get_formatted_cwd(void) {
     return formatted;
 }
 
-int execute_command(char** args) {
+int _command(char** args) {
     pid_t parent_pid = getpid();
     pid_t pid = fork();
     int in_fd = STDIN_FILENO;
