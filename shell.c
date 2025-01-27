@@ -155,6 +155,9 @@ void shell_interactive_loop(void) {
     bool QUIT = false;
     int ch;
 
+    // Initial newline for better formatting
+    printf("\n");
+
     do {
         // Clear line before printing prompt
         move(line, 0);
@@ -179,6 +182,9 @@ void shell_interactive_loop(void) {
             case KEY_ENTER:
             case ENTER:
                 if (command.count > 0) {
+                    // Move to new line before executing command
+                    printf("\n");
+                    
                     // Null-terminate the string for processing
                     command.data[command.count] = '\0';
 
@@ -193,12 +199,13 @@ void shell_interactive_loop(void) {
                     int result = process_command(command.data);
                     if (result == 0) {
                         QUIT = true;
-                    } else if (result == -1) {
-                        mvprintw(0, 0, "Command execution failed: %s\n", strerror(errno));
                     }
 
                     // Clear the command
                     string_clear(&command);
+                    
+                    // Move cursor to new line for next prompt
+                    printf("\n");
                 }
                 break;
             case KEY_BACKSPACE:
@@ -220,8 +227,6 @@ void shell_interactive_loop(void) {
 
     // Print and free command history
     for (size_t i = 0; i < command_history.count; i++) {
-        printf("%.*s\n", (int)command_history.data[i].count, 
-               command_history.data[i].data);
         free(command_history.data[i].data);
     }
     free(command_history.data);
@@ -325,27 +330,42 @@ void handle_io_redirection(char** args, int* in_fd, int* out_fd) {
         if (strcmp(args[i], "<") == 0 && args[i + 1] != NULL) {
             *in_fd = open(args[i + 1], O_RDONLY);
             if (*in_fd == -1) {
-                mvprintw(0, 0, "Error opening input file: %s\n", strerror(errno));
-                refresh();
+                printf("\nError opening input file '%s': %s\n", 
+                       args[i + 1], strerror(errno));
                 return;
             }
+            // Mark these arguments for removal
+            args[i] = NULL;
+            args[i + 1] = NULL;
+            i++;  // Skip the filename
         } else if (strcmp(args[i], ">") == 0 && args[i + 1] != NULL) {
-            *out_fd = open(args[i + 1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            *out_fd = open(args[i + 1], 
+                          O_WRONLY | O_CREAT | O_TRUNC, 
+                          0644);
             if (*out_fd == -1) {
-                mvprintw(0, 0, "Error opening output file: %s\n", strerror(errno));
-                refresh();
+                printf("\nError opening output file '%s': %s\n", 
+                       args[i + 1], strerror(errno));
                 return;
             }
+            // Mark these arguments for removal
+            args[i] = NULL;
+            args[i + 1] = NULL;
+            i++;  // Skip the filename
         }
     }
 }
 
 // Modified execute_external_command to handle I/O redirection and print output in a new line
+
 int execute_external_command(char** args, int in_fd, int out_fd) {
     pid_t pid = fork();
 
     if (pid == 0) {
         // Child process
+        // Move cursor to new line before executing command
+        printf("\n");
+        fflush(stdout);
+        
         if (in_fd != STDIN_FILENO) {
             dup2(in_fd, STDIN_FILENO);
             close(in_fd);
@@ -356,8 +376,7 @@ int execute_external_command(char** args, int in_fd, int out_fd) {
         }
 
         if (execvp(args[0], args) == -1) {
-            mvprintw(0, 0, "Command execution failed: %s\n", strerror(errno));
-            refresh();
+            printf("Command execution failed: %s\n", strerror(errno));
             exit(EXIT_FAILURE);
         }
     } else if (pid < 0) {
@@ -371,11 +390,9 @@ int execute_external_command(char** args, int in_fd, int out_fd) {
             waitpid(pid, &status, WUNTRACED);
         } while (!WIFEXITED(status) && !WIFSIGNALED(status));
 
-        // Print a new line after successful command execution
-        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-            mvprintw(LINES - 1, 0, "\n");
-            refresh();
-        }
+        // Print a new line after command execution
+        printf("\n");
+        fflush(stdout);
     }
 
     return 1;
@@ -489,12 +506,16 @@ int handle_help(char** args) {
 
     if (pid == 0) {
         // Child process
-        char* help_args[] = {"echo", "Available commands:\n  cd [directory] [-P]\n  help\n  exit\n  ls [directory]\n  Custom executables in current directory\n", NULL};
-        if (execvp(help_args[0], help_args) == -1) {
-            mvprintw(0, 0, "Command execution failed: %s\n", strerror(errno));
-            refresh();
-            exit(EXIT_FAILURE);
-        }
+        printf("\nAvailable Commands:\n");
+        printf("------------------\n");
+        printf("cd [directory] [-P]    : Change current directory\n");
+        printf("help                   : Display this help message\n");
+        printf("exit                   : Exit the shell\n");
+        printf("ls [directory]         : List directory contents\n");
+        printf("[command] < [input]    : Redirect input from file\n");
+        printf("[command] > [output]   : Redirect output to file\n");
+        printf("\nCustom executables in current directory are also supported.\n\n");
+        exit(EXIT_SUCCESS);
     } else if (pid < 0) {
         mvprintw(0, 0, "Fork failed: %s\n", strerror(errno));
         refresh();
