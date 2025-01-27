@@ -209,41 +209,6 @@ int is_executable(const char* path) {
     return (stat(path, &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & S_IXUSR));
 }
 
-/*int process_command(char* command_line) {
-    char** args = parse_command(command_line);
-    int result = 1;
-
-    if (args[0] == NULL) {
-        free(args);
-        return 1;
-    }
-
-    // Check built-in commands
-    if (strcmp(args[0], "cd") == 0) {
-        result = handle_cd(args);
-    } else if (strcmp(args[0], "help") == 0) {
-        result = handle_help(args);
-    } else if (strcmp(args[0], "exit") == 0) {
-        result = shell_exit(args);
-    } else if (strcmp(args[0], "ls") == 0) {
-        list_directory(args);
-    } else {
-        // Check for executable files in current directory or full path
-        char full_path[MAX_INPUT_SIZE];
-        snprintf(full_path, sizeof(full_path), "./%s", args[0]);
-        
-        if (is_executable(full_path) || is_executable(args[0])) {
-            result = execute_external_command(args);
-        } else {
-            // External command
-            result = execute_external_command(args);
-        }
-    }
-
-    free(args);
-    return result;
-}*/
-
 int process_command(char* command_line) {
     char** args = parse_command(command_line);
     int result = 1;
@@ -332,64 +297,6 @@ void handle_io_redirection(char** args, int* in_fd, int* out_fd) {
     }
 }
 
-/*int execute_external_command(char** args) {
-    pid_t pid = fork();
-
-    if (pid == 0) {
-        // Child process
-        if (execvp(args[0], args) == -1) {
-            mvprintw(0, 0, "Command execution failed: %s\n", strerror(errno));
-            refresh();
-            exit(EXIT_FAILURE);
-        }
-    } else if (pid < 0) {
-        mvprintw(0, 0, "Fork failed: %s\n", strerror(errno));
-        refresh();
-        return 0;
-    } else {
-        // Parent process
-        int status;
-        do {
-            waitpid(pid, &status, WUNTRACED);
-        } while (!WIFEXITED(status) && !WIFSIGNALED(status));
-    }
-
-    return 1;
-}*/
-
-/*int handle_cd(char** args) {
-    int arg_count = 0;
-    while (args[arg_count] != NULL) arg_count++;
-
-    if (arg_count == 1) {
-        chdir(getenv("HOME") ?: ".");
-    } else {
-        for (int i = 1; i < arg_count; i++) {
-            if (args[i][0] == '-') {
-                if (strcmp(args[i], "-P") == 0) {
-                    char resolved_path[MAX_INPUT_SIZE];
-                    if (realpath(args[i+1], resolved_path) != NULL) {
-                        chdir(resolved_path);
-                    } else {
-                        mvprintw(0, 0, "cd: %s\n", strerror(errno));
-                        refresh();
-                    }
-                } else {
-                    mvprintw(0, 0, "Unknown cd option: %s\n", args[i]);
-                    refresh();
-                }
-            } else {
-                if (chdir(args[i]) != 0) {
-                    mvprintw(0, 0, "cd: %s\n", strerror(errno));
-                    refresh();
-                }
-            }
-        }
-    }
-    return 1;
-}*/
-
-
 // Modified execute_external_command to handle I/O redirection
 int execute_external_command(char** args, int in_fd, int out_fd) {
     pid_t pid = fork();
@@ -450,11 +357,11 @@ char** remove_redirection_args(char** args) {
 }
 
 
-// Enhanced CD implementation
 int handle_cd(char** args) {
     char* home = getenv("HOME");
     char* oldpwd = getenv("OLDPWD");
     char current[PATH_MAX];
+    char resolved_path[PATH_MAX];
     bool follow_symlinks = true;
     int i = 1;
 
@@ -472,51 +379,75 @@ int handle_cd(char** args) {
         } else if (strcmp(args[i], "-L") == 0) {
             follow_symlinks = true;
         } else if (strcmp(args[i], "-") == 0) {
-            if (oldpwd != NULL) {
-                args[i] = oldpwd;
+            if (oldpwd) {
+                if (chdir(oldpwd) != 0) {
+                    mvprintw(0, 0, "cd: %s\n", strerror(errno));
+                    refresh();
+                } else {
+                    setenv("OLDPWD", current, 1);
+                    char* newpwd = getcwd(NULL, 0);
+                    setenv("PWD", newpwd, 1);
+                    free(newpwd);
+                }
+                return 1;
             } else {
                 mvprintw(0, 0, "cd: OLDPWD not set\n");
                 refresh();
                 return 1;
             }
-            break;
-        } else {
-            mvprintw(0, 0, "cd: invalid option: %s\n", args[i]);
-            refresh();
-            return 1;
         }
         i++;
     }
 
-    // Determine target directory
-    char* dir = args[i];
-    if (dir == NULL) {
-        dir = home ? home : ".";
+    // Handle no arguments or '~'
+    if (args[i] == NULL || strcmp(args[i], "~") == 0) {
+        if (home) {
+            if (chdir(home) != 0) {
+                mvprintw(0, 0, "cd: %s\n", strerror(errno));
+                refresh();
+            } else {
+                setenv("OLDPWD", current, 1);
+                char* newpwd = getcwd(NULL, 0);
+                setenv("PWD", newpwd, 1);
+                free(newpwd);
+            }
+        } else {
+            mvprintw(0, 0, "cd: HOME not set\n");
+            refresh();
+        }
+        return 1;
     }
+
+    // Handle quoted paths and construct full path
+    char* dir = args[i];
+    char* unquoted_path = NULL;
+    
+    // Remove quotes if present
+    if (dir[0] == '\'' && dir[strlen(dir) - 1] == '\'') {
+        unquoted_path = strdup(dir + 1);
+        unquoted_path[strlen(unquoted_path) - 1] = '\0';
+    } else {
+        unquoted_path = strdup(dir);
+    }
+
+    // Construct full path for relative paths
+    if (unquoted_path[0] != '/') {
+        snprintf(resolved_path, PATH_MAX, "%s/%s", current, unquoted_path);
+    } else {
+        strncpy(resolved_path, unquoted_path, PATH_MAX - 1);
+    }
+    
+    free(unquoted_path);
 
     // Change directory
-    if (follow_symlinks) {
-        if (chdir(dir) != 0) {
-            mvprintw(0, 0, "cd: %s: %s\n", dir, strerror(errno));
-            refresh();
-            return 1;
-        }
+    if (chdir(resolved_path) != 0) {
+        mvprintw(0, 0, "cd: %s: %s\n", resolved_path, strerror(errno));
+        refresh();
     } else {
-        char resolved[PATH_MAX];
-        if (realpath(dir, resolved) == NULL || chdir(resolved) != 0) {
-            mvprintw(0, 0, "cd: %s: %s\n", dir, strerror(errno));
-            refresh();
-            return 1;
-        }
-    }
-
-    // Update OLDPWD
-    setenv("OLDPWD", current, 1);
-
-    // Update PWD
-    char new_pwd[PATH_MAX];
-    if (getcwd(new_pwd, sizeof(new_pwd)) != NULL) {
-        setenv("PWD", new_pwd, 1);
+        setenv("OLDPWD", current, 1);
+        char* newpwd = getcwd(NULL, 0);
+        setenv("PWD", newpwd, 1);
+        free(newpwd);
     }
 
     return 1;
