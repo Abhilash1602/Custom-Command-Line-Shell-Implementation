@@ -283,19 +283,38 @@ char** parse_command(char* line) {
     char** tokens = malloc(bufsize * sizeof(char*));
     char* token;
     int position = 0;
+    bool in_quotes = false;
+    char* start = line;
 
     if (!tokens) {
         perror("Allocation error");
         exit(EXIT_FAILURE);
     }
 
-    token = strtok(line, DELIMITERS);
-    while (token != NULL) {
-        tokens[position++] = token;
-        token = strtok(NULL, DELIMITERS);
+    for (char* p = line; *p != '\0'; p++) {
+        if (*p == '\'') {
+            in_quotes = !in_quotes;
+            if (!in_quotes) {
+                *p = '\0';
+                tokens[position++] = strdup(start);
+                start = p + 1;
+            } else {
+                start = p + 1;
+            }
+        } else if (!in_quotes && strchr(DELIMITERS, *p)) {
+            *p = '\0';
+            if (start != p) {
+                tokens[position++] = start;
+            }
+            start = p + 1;
+        }
     }
-    tokens[position] = NULL;
 
+    if (start != line + strlen(line)) {
+        tokens[position++] = start;
+    }
+
+    tokens[position] = NULL;
     return tokens;
 }
 
