@@ -9,17 +9,18 @@
 #include <dirent.h>
 #include <errno.h>
 #include <sys/stat.h>
-#include <limits.h>    // For PATH_MAX on most systems
-#include <linux/limits.h>  // For PATH_MAX on some Linux systems
+#include <limits.h>        
+#include <linux/limits.h>  
+#include <locale.h>
+#include <ctype.h>
 
-// Fallback definition if PATH_MAX is not defined
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
 #define ctrl(x) ((x) & 0x1f)
 #define ENTER 10
-#define SHELL "[TIMBEE 2.0]$ "
+#define SHELL "[SHELL]$ "
 #define DATA_START_CAPACITY 128
 #define MAX_INPUT_SIZE 1024
 #define MAX_ARGS 64
@@ -61,6 +62,7 @@ typedef struct {
     size_t count;
     size_t capacity;
 } Strings;
+
 
 // Existing function declarations
 void shell_initialize(void);
@@ -143,95 +145,110 @@ char** remove_redirection_args(char** args) {
 // Main shell interactive loop
 void shell_interactive_loop(void) {
     shell_initialize();
+    setlocale(LC_ALL, "");
 
-    String command;
-    Strings command_history;
-    string_init(&command);
-    command_history.data = NULL;
-    command_history.count = 0;
-    command_history.capacity = 0;
-
-    int line = LINES - 1;
+    String command = {NULL, 0, 0};
+    Strings command_history = {NULL, 0, 0};
     bool QUIT = false;
     int ch;
+    size_t current_line = 0;  // Track current line position
 
-    // Initial newline for better formatting
-    printf("\n");
-
-    do {
-        // Clear line before printing prompt
-        move(line, 0);
+    // Initialize screen
+    clear();
+    
+    while (!QUIT) {
+        // Move to current line and clear it
+        move(current_line, 0);
         clrtoeol();
 
-        // Get formatted current working directory
+        // Get and display current directory in prompt
         char* formatted_cwd = get_formatted_cwd();
-
-        // Display prompt with current directory
-        mvprintw(line, 0, "timbee-2-0:%s$ ", formatted_cwd);
+        mvprintw(current_line, 0, "shell%s$ ", formatted_cwd);
 
         // Display current command
         if (command.data) {
-            mvprintw(line, strlen("timbee-2-0:") + strlen(formatted_cwd) + 2, 
+            mvprintw(current_line, strlen("shell:") + strlen(formatted_cwd) + 2, 
                     "%.*s", (int)command.count, command.data);
         }
         refresh();
 
-        // Get input
         ch = getch();
         switch (ch) {
+            case ctrl('q'):
+                QUIT = true;
+                break;
+
             case KEY_ENTER:
             case ENTER:
                 if (command.count > 0) {
-                    // Move to new line before executing command
-                    printf("\n");
+                    // Move to next line before processing command
+                    current_line++;
+                    if (current_line >= LINES - 1) {
+                        // If we're at bottom of screen, scroll up
+                        scrl(1);
+                        current_line = LINES - 2;
+                    }
                     
-                    // Null-terminate the string for processing
-                    command.data[command.count] = '\0';
+                    // Null terminate the command
+                    DA_APPEND(&command, '\0');
+                    command.count--;  // Don't count null terminator in length
 
-                    // Add to command history
-                    String hist_command;
-                    hist_command.data = strdup(command.data);
-                    hist_command.count = command.count;
-                    hist_command.capacity = command.count + 1;
-                    DA_APPEND(&command_history, hist_command);
+                    // Add to history
+                    String hist_cmd;
+                    hist_cmd.data = strdup(command.data);
+                    hist_cmd.count = command.count;
+                    hist_cmd.capacity = command.capacity;
+                    DA_APPEND(&command_history, hist_cmd);
 
-                    // Process the command
+                    // Process command
                     int result = process_command(command.data);
                     if (result == 0) {
                         QUIT = true;
                     }
 
-                    // Clear the command
-                    string_clear(&command);
-                    
-                    // Move cursor to new line for next prompt
-                    printf("\n");
+                    // Clear current command
+                    free(command.data);
+                    command = (String){NULL, 0, 0};
+
+                    // Move to next line for next prompt
+                    current_line++;
+                    if (current_line >= LINES - 1) {
+                        scrl(1);
+                        current_line = LINES - 2;
+                    }
                 }
                 break;
+
             case KEY_BACKSPACE:
             case 127:
                 if (command.count > 0) {
                     command.count--;
-                    command.data[command.count] = '\0';
                 }
                 break;
+
             default:
-                string_append(&command, ch);
+                if (isprint(ch)) {
+                    DA_APPEND(&command, ch);
+                }
                 break;
         }
+
         refresh();
-    } while (!QUIT);
+    }
 
     // Cleanup
-    shell_terminate();
+    endwin();
 
-    // Print and free command history
+    // Print command history
+    printf("\nCommand History:\n");
     for (size_t i = 0; i < command_history.count; i++) {
+        printf("%.*s\n", (int)command_history.data[i].count, command_history.data[i].data);
         free(command_history.data[i].data);
     }
     free(command_history.data);
     free(command.data);
 }
+
 
 // Existing functions from previous implementation
 int is_executable(const char* path) {
@@ -564,6 +581,7 @@ void shell_initialize(void) {
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
+    scrollok(stdscr, TRUE);  // Enable scrolling
 }
 
 void shell_terminate(void) {

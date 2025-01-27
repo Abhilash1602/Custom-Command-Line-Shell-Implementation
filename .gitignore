@@ -1,3 +1,11 @@
 .vscode
 *.exe
 shell
+cat.c
+cat
+cat.o
+fact.c
+fact.o
+i_o.txt
+fact
+
