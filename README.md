@@ -48,7 +48,7 @@ This project implements a custom command-line shell in C, offering an interactiv
 - The shell spawns child processes for command execution. By capturing the system's process hierarchy (e.g., using `ps` or `pstree`), users can visualize the parent-child relationship.
 - A snapshot of the process tree, demonstrating this hierarchy, is included below:
 
-![Process Tree Snapshot](process_tree.png)
+![Process Tree Snapshot](Process_tree.png)
 
 ---
 
@@ -131,8 +131,22 @@ shell~$ ./fact 10 < input.txt > output.txt
 
 ---
 
-## Process Tree Snapshot
-Below is a visual representation of the process hierarchy during shell execution:
+## Prerequisites
 
-![alt text](Process_tree.png)
----
+Ensure `make` is installed on your system. If not, you can install it using the following command:
+
+```bash
+sudo apt install make
+```
+
+## How to Compile and Run
+
+1. **Compile** the code using `make`:
+   ```bash
+   make
+   ```
+
+2. **Run** the shell:
+   ```bash
+   ./shell
+   ```

@@ -8,4 +8,7 @@ fact.c
 fact.o
 i_o.txt
 fact
+exp.c
+exp
+exp.o
 

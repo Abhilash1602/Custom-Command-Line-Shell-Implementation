@@ -9,10 +9,11 @@
 #include <dirent.h>
 #include <errno.h>
 #include <sys/stat.h>
-#include <limits.h>        
-#include <linux/limits.h>  
+#include <limits.h>
+#include <linux/limits.h>
 #include <locale.h>
 #include <ctype.h>
+#include <time.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -20,369 +21,447 @@
 
 #define ctrl(x) ((x) & 0x1f)
 #define ENTER 10
-#define SHELL "[SHELL]$ "
+#define SHELL "[custom_shell]$ "
 #define DATA_START_CAPACITY 128
 #define MAX_INPUT_SIZE 1024
 #define MAX_ARGS 64
 #define DELIMITERS " \t\r\n\a"
 
-#define ASSERT(cond, ...)                                      \
-    do {                                                      \
-        if (!(cond)) {                                        \
-            fprintf(stderr, "%s:%d: ASSERTION FAILED: ",      \
-                    __FILE__, __LINE__);                      \
-            fprintf(stderr, __VA_ARGS__);                     \
-            fprintf(stderr, "\n");                            \
-            exit(1);                                          \
-        }                                                     \
-    } while (0)
-
-#define DA_APPEND(da, item)                                    \
-    do {                                                      \
-        if ((da)->count >= (da)->capacity) {                  \
-            (da)->capacity = (da)->capacity == 0              \
-                               ? DATA_START_CAPACITY          \
-                               : (da)->capacity * 2;          \
-            void *new = realloc((da)->data,                   \
-                               (da)->capacity * sizeof(*(da)->data)); \
-            ASSERT(new, "out of memory");                     \
-            (da)->data = new;                                 \
-        }                                                     \
-        (da)->data[(da)->count++] = (item);                   \
-    } while (0)
-
 typedef struct {
-    char *data;
+    char* data;
     size_t count;
     size_t capacity;
 } String;
 
 typedef struct {
-    String *data;
+    String* data;
     size_t count;
     size_t capacity;
 } Strings;
 
+typedef struct {
+    int cursor_pos;
+    String clipboard;
+    String current_cmd;
+    Strings history;
+    int history_pos;
+    bool searching;
+    String search_term;
+    int current_line;
+} ShellState;
 
-// Existing function declarations
+// Function declarations
 void shell_initialize(void);
 void shell_terminate(void);
-int process_command(char* command_line);
-char** parse_command(char* line);
-int execute_external_command(char** args, int in_fd, int out_fd);
-void list_directory(char** args);
-int is_executable(const char* path);
-int handle_cd(char** args);
-int handle_help(char** args);
-int shell_exit(char** args);
+void shell_interactive_loop(void);
 char* get_formatted_cwd(void);
+char** parse_command(char* line);
+int execute_command(char** args);
+int handle_cd(char** args);
+int handle_exit(char** args);
+void execute_help_command(void);
 void handle_io_redirection(char** args, int* in_fd, int* out_fd);
-int count_args(char** args);
-char** remove_redirection_args(char** args);
-
+void handle_cursor_movement(int ch, ShellState* state);
+void handle_line_editing(int ch, ShellState* state);
+void handle_history(int ch, ShellState* state);
+void handle_search(int ch, ShellState* state);
+void redraw_prompt(ShellState* state);
+void clear_screen_keep_prompt(ShellState* state);
 
 // String handling functions
-void string_init(String *str) {
+void string_init(String* str) {
     str->data = NULL;
     str->count = 0;
     str->capacity = 0;
 }
 
-void string_append(String *str, char ch) {
-    DA_APPEND(str, ch);
-}
-
-void string_clear(String *str) {
-    free(str->data);
-    string_init(str);
-}
-
-// Get formatted current working directory
-char* get_formatted_cwd(void) {
-    char cwd[PATH_MAX];
-    char* home = getenv("HOME");
-    static char formatted[PATH_MAX];
-
-    if (getcwd(cwd, sizeof(cwd)) == NULL) {
-        return "[ERROR]";
-    }
-
-    // Replace home directory with ~
-    if (home && strncmp(cwd, home, strlen(home)) == 0) {
-        snprintf(formatted, sizeof(formatted), "~%s", cwd + strlen(home));
-    } else {
-        strncpy(formatted, cwd, sizeof(formatted) - 1);
-    }
-
-    return formatted;
-}
-
-char** remove_redirection_args(char** args) {
-    int count = 0;
-    for (int i = 0; args[i] != NULL; i++) {
-        if (strcmp(args[i], "<") == 0 || strcmp(args[i], ">") == 0) {
-            i++; // Skip the redirection operator and filename
-        } else {
-            count++;
+void string_append(String* str, char ch) {
+    if (str->count >= str->capacity) {
+        str->capacity = str->capacity == 0 ? DATA_START_CAPACITY : str->capacity * 2;
+        char* new_data = realloc(str->data, str->capacity);
+        if (!new_data) {
+            endwin();
+            fprintf(stderr, "Memory allocation failed\n");
+            exit(1);
         }
+        str->data = new_data;
     }
-
-    char** clean_args = malloc((count + 1) * sizeof(char*));
-    int j = 0;
-    for (int i = 0; args[i] != NULL; i++) {
-        if (strcmp(args[i], "<") == 0 || strcmp(args[i], ">") == 0) {
-            i++; // Skip the redirection operator and filename
-        } else {
-            clean_args[j++] = args[i];
-        }
-    }
-    clean_args[j] = NULL;
-
-    return clean_args;
+    str->data[str->count++] = ch;
 }
 
+void string_clear(String* str) {
+    if (str->data) {
+        free(str->data);
+        string_init(str);
+    }
+}
 
-// Main shell interactive loop
+// Shell state initialization
+void init_shell_state(ShellState* state) {
+    string_init(&state->current_cmd);
+    string_init(&state->clipboard);
+    state->cursor_pos = 0;
+    state->history_pos = -1;
+    state->searching = false;
+    string_init(&state->search_term);
+    state->history.data = NULL;
+    state->history.count = 0;
+    state->history.capacity = 0;
+}
+
+char* get_timestamp() {
+    static char buffer[26];
+    time_t timer;
+    struct tm* tm_info;
+
+    time(&timer);
+    tm_info = localtime(&timer);
+    strftime(buffer, 26, "%Y-%m-%d %H:%M:%S", tm_info);
+    return buffer;
+}
+
+// Main shell loop
 void shell_interactive_loop(void) {
     shell_initialize();
-    setlocale(LC_ALL, "");
-
-    String command = {NULL, 0, 0};
-    Strings command_history = {NULL, 0, 0};
-    bool QUIT = false;
-    int ch;
-    size_t current_line = 0;  // Track current line position
-
-    // Initialize screen
-    clear();
+    ShellState state;
+    init_shell_state(&state);
     
-    while (!QUIT) {
-        // Move to current line and clear it
-        move(current_line, 0);
-        clrtoeol();
-
-        // Get and display current directory in prompt
-        char* formatted_cwd = get_formatted_cwd();
-        mvprintw(current_line, 0, "shell%s$ ", formatted_cwd);
-
-        // Display current command
-        if (command.data) {
-            mvprintw(current_line, strlen("shell:") + strlen(formatted_cwd) + 2, 
-                    "%.*s", (int)command.count, command.data);
-        }
-        refresh();
-
+    int ch;
+    bool running = true;
+    
+    while (running) {
+        redraw_prompt(&state);
         ch = getch();
+        
+        if (ch == ctrl('d') && state.current_cmd.count == 0) {
+            running = false;
+            continue;
+        }
+        
+        if (state.searching) {
+            handle_search(ch, &state);
+            continue;
+        }
+        
         switch (ch) {
-            case ctrl('q'):
-                QUIT = true;
+            case ctrl('a'): // Move to beginning
+                state.cursor_pos = 0;
                 break;
-
-            case KEY_ENTER:
-            case ENTER:
-                if (command.count > 0) {
-                    // Move to next line before processing command
-                    current_line++;
-                    if (current_line >= LINES - 1) {
-                        // If we're at bottom of screen, scroll up
-                        scrl(1);
-                        current_line = LINES - 2;
+                
+            case ctrl('e'): // Move to end
+                state.cursor_pos = state.current_cmd.count;
+                break;
+                
+            case ctrl('b'): // Move backward
+                if (state.cursor_pos > 0) state.cursor_pos--;
+                break;
+                
+            case ctrl('f'): // Move forward
+                if (state.cursor_pos < state.current_cmd.count) state.cursor_pos++;
+                break;
+                
+            case ctrl('k'): // Cut after cursor
+                if (state.cursor_pos < state.current_cmd.count) {
+                    string_clear(&state.clipboard);
+                    for (size_t i = state.cursor_pos; i < state.current_cmd.count; i++) {
+                        string_append(&state.clipboard, state.current_cmd.data[i]);
+                    }
+                    state.current_cmd.count = state.cursor_pos;
+                }
+                break;
+                
+            case ctrl('u'): // Cut before cursor
+                if (state.cursor_pos > 0) {
+                    string_clear(&state.clipboard);
+                    for (size_t i = 0; i < state.cursor_pos; i++) {
+                        string_append(&state.clipboard, state.current_cmd.data[i]);
+                    }
+                    memmove(state.current_cmd.data, 
+                           state.current_cmd.data + state.cursor_pos,
+                           state.current_cmd.count - state.cursor_pos);
+                    state.current_cmd.count -= state.cursor_pos;
+                    state.cursor_pos = 0;
+                }
+                break;
+                
+            case ctrl('y'): // Paste
+                if (state.clipboard.count > 0) {
+                    // Make space for paste
+                    if (state.current_cmd.count + state.clipboard.count >= state.current_cmd.capacity) {
+                        size_t new_cap = (state.current_cmd.count + state.clipboard.count) * 2;
+                        char* new_data = realloc(state.current_cmd.data, new_cap);
+                        if (!new_data) {
+                            endwin();
+                            fprintf(stderr, "Memory allocation failed\n");
+                            exit(1);
+                        }
+                        state.current_cmd.data = new_data;
+                        state.current_cmd.capacity = new_cap;
                     }
                     
-                    // Null terminate the command
-                    DA_APPEND(&command, '\0');
-                    command.count--;  // Don't count null terminator in length
+                    // Move existing content
+                    memmove(state.current_cmd.data + state.cursor_pos + state.clipboard.count,
+                           state.current_cmd.data + state.cursor_pos,
+                           state.current_cmd.count - state.cursor_pos);
+                    
+                    // Insert clipboard content
+                    memcpy(state.current_cmd.data + state.cursor_pos,
+                           state.clipboard.data,
+                           state.clipboard.count);
+                    
+                    state.cursor_pos += state.clipboard.count;
+                    state.current_cmd.count += state.clipboard.count;
+                }
+                break;
+                
+            case ctrl('l'): // Clear screen
+                clear_screen_keep_prompt(&state);
+                break;
+                
+            case ctrl('r'): // Reverse search
+                state.searching = true;
+                string_clear(&state.search_term);
+                break;
 
-                    // Add to history
-                    String hist_cmd;
-                    hist_cmd.data = strdup(command.data);
-                    hist_cmd.count = command.count;
-                    hist_cmd.capacity = command.capacity;
-                    DA_APPEND(&command_history, hist_cmd);
-
-                    // Process command
-                    int result = process_command(command.data);
-                    if (result == 0) {
-                        QUIT = true;
+            case KEY_UP:
+                if (state.history.count > 0) {
+                    if (state.history_pos == -1) {
+                        state.history_pos = state.history.count - 1;
+                    } else if (state.history_pos > 0) {
+                        state.history_pos--;
                     }
-
-                    // Clear current command
-                    free(command.data);
-                    command = (String){NULL, 0, 0};
-
-                    // Move to next line for next prompt
-                    current_line++;
-                    if (current_line >= LINES - 1) {
-                        scrl(1);
-                        current_line = LINES - 2;
+                    string_clear(&state.current_cmd);
+                    for (size_t i = 0; i < state.history.data[state.history_pos].count; i++) {
+                        string_append(&state.current_cmd, state.history.data[state.history_pos].data[i]);
                     }
+                    state.cursor_pos = state.current_cmd.count;
+                }
+                break;
+                
+            case KEY_DOWN:
+                if (state.history_pos != -1) {
+                    if (state.history_pos < state.history.count - 1) {
+                        state.history_pos++;
+                        string_clear(&state.current_cmd);
+                        for (size_t i = 0; i < state.history.data[state.history_pos].count; i++) {
+                            string_append(&state.current_cmd, state.history.data[state.history_pos].data[i]);
+                        }
+                    } else {
+                        state.history_pos = -1;
+                        string_clear(&state.current_cmd);
+                    }
+                    state.cursor_pos = state.current_cmd.count;
                 }
                 break;
 
+            case ENTER:
+                if (state.current_cmd.count > 0) {
+                    string_append(&state.current_cmd, '\0');
+                    char** args = parse_command(state.current_cmd.data);
+                    if (args != NULL) {
+                        if (strcmp(args[0], "exit") == 0) {
+                            running = false;
+                        } else if (strcmp(args[0], "cd") == 0) {
+                            handle_cd(args);
+                        } else if (strcmp(args[0], "help") == 0) {
+                            execute_help_command();
+                        } else {
+                            printw("\n");  // New line before command output
+                            execute_command(args);
+                        }
+                        free(args);
+                    }
+                    
+                    // Add to history
+                    String hist_cmd = {
+                        .data = strdup(state.current_cmd.data),
+                        .count = state.current_cmd.count,
+                        .capacity = state.current_cmd.count
+                    };
+                    if (state.history.count >= state.history.capacity) {
+                        size_t new_cap = state.history.capacity == 0 ? 
+                            DATA_START_CAPACITY : state.history.capacity * 2;
+                        String* new_data = realloc(state.history.data, 
+                                                 new_cap * sizeof(String));
+                        if (!new_data) {
+                            endwin();
+                            fprintf(stderr, "Memory allocation failed\n");
+                            exit(1);
+                        }
+                        state.history.data = new_data;
+                        state.history.capacity = new_cap;
+                    }
+                    state.history.data[state.history.count++] = hist_cmd;
+                    
+                    string_clear(&state.current_cmd);
+                    state.cursor_pos = 0;
+                    state.history_pos = -1;
+                    state.current_line += 1;  // Move down one lines after command
+                    if (state.current_line >= LINES - 1) {
+                        scroll(stdscr);
+                        state.current_line = LINES - 2;
+                    }
+                }
+                break;
+                
             case KEY_BACKSPACE:
             case 127:
-                if (command.count > 0) {
-                    command.count--;
+                if (state.cursor_pos > 0) {
+                    memmove(state.current_cmd.data + state.cursor_pos - 1,
+                           state.current_cmd.data + state.cursor_pos,
+                           state.current_cmd.count - state.cursor_pos);
+                    state.current_cmd.count--;
+                    state.cursor_pos--;
+                    redraw_prompt(&state);
                 }
                 break;
-
+                
             default:
                 if (isprint(ch)) {
-                    DA_APPEND(&command, ch);
+                    if (state.current_cmd.count >= state.current_cmd.capacity) {
+                        size_t new_cap = state.current_cmd.capacity == 0 ? 
+                            DATA_START_CAPACITY : state.current_cmd.capacity * 2;
+                        char* new_data = realloc(state.current_cmd.data, new_cap);
+                        if (!new_data) {
+                            endwin();
+                            fprintf(stderr, "Memory allocation failed\n");
+                            exit(1);
+                        }
+                        state.current_cmd.data = new_data;
+                        state.current_cmd.capacity = new_cap;
+                    }
+                    memmove(state.current_cmd.data + state.cursor_pos + 1,
+                           state.current_cmd.data + state.cursor_pos,
+                           state.current_cmd.count - state.cursor_pos);
+                    state.current_cmd.data[state.cursor_pos] = ch;
+                    state.current_cmd.count++;
+                    state.cursor_pos++;
                 }
                 break;
         }
-
-        refresh();
     }
-
+    
     // Cleanup
-    endwin();
-
-    // Print command history
-    printf("\nCommand History:\n");
-    for (size_t i = 0; i < command_history.count; i++) {
-        printf("%.*s\n", (int)command_history.data[i].count, command_history.data[i].data);
-        free(command_history.data[i].data);
+    string_clear(&state.current_cmd);
+    string_clear(&state.clipboard);
+    string_clear(&state.search_term);
+    for (size_t i = 0; i < state.history.count; i++) {
+        string_clear(&state.history.data[i]);
     }
-    free(command_history.data);
-    free(command.data);
+    free(state.history.data);
+    
+    shell_terminate();
 }
 
-
-// Existing functions from previous implementation
-int is_executable(const char* path) {
-    struct stat st;
-    return (stat(path, &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & S_IXUSR));
+void execute_help_command(void) {
+    printw("\n\nAvailable Commands:\n");
+    printw("------------------\n");
+    printw("cd [directory]     : Change current directory\n");
+    printw("help              : Display this help message\n");
+    printw("exit              : Exit the shell\n");
+    printw("ls [directory]    : List directory contents\n");
+    printw("[cmd] < [input]   : Redirect input from file\n");
+    printw("[cmd] > [output]  : Redirect output to file\n");
+    printw("\nKeyboard Shortcuts:\n");
+    printw("-----------------\n");
+    printw("CTRL+A : Move to beginning of line\n");
+    printw("CTRL+E : Move to end of line\n");
+    printw("CTRL+K : Cut text after cursor\n");
+    printw("CTRL+U : Cut text before cursor\n");
+    printw("CTRL+Y : Paste cut text\n");
+    printw("CTRL+R : Search command history\n");
+    printw("UP     : Previous command\n");
+    printw("DOWN   : Next command\n");
+    printw("\n");
+    refresh();
 }
-
-int process_command(char* command_line) {
-    char** args = parse_command(command_line);
-    int result = 1;
-    int in_fd = STDIN_FILENO;
-    int out_fd = STDOUT_FILENO;
-
-    if (args[0] == NULL) {
-        free(args);
-        return 1;
-    }
-
-    // Handle I/O redirection
-    handle_io_redirection(args, &in_fd, &out_fd);
-    char** clean_args = remove_redirection_args(args);
-
-    if (clean_args[0] == NULL) {
-        free(clean_args);
-        free(args);
-        return 1;
-    }
-
-    // Check built-in commands
-    if (strcmp(clean_args[0], "cd") == 0) {
-        result = handle_cd(clean_args);
-    } else if (strcmp(clean_args[0], "help") == 0) {
-        result = handle_help(clean_args);
-    } else if (strcmp(clean_args[0], "exit") == 0) {
-        result = shell_exit(clean_args);
-    } else if (strcmp(clean_args[0], "ls") == 0) {
-        result = execute_external_command(clean_args, in_fd, out_fd);
-    } else {
-        result = execute_external_command(clean_args, in_fd, out_fd);
-    }
-
-    // Restore standard file descriptors if they were changed
-    if (in_fd != STDIN_FILENO) close(in_fd);
-    if (out_fd != STDOUT_FILENO) close(out_fd);
-
-    free(clean_args);
-    free(args);
-    return result;
-}
-
-
-char** parse_command(char* line) {
-    int bufsize = MAX_ARGS;
-    char** tokens = malloc(bufsize * sizeof(char*));
-    char* token;
-    int position = 0;
-    bool in_quotes = false;
-    char* start = line;
-
-    if (!tokens) {
-        perror("Allocation error");
-        exit(EXIT_FAILURE);
-    }
-
-    for (char* p = line; *p != '\0'; p++) {
-        if (*p == '\'') {
-            in_quotes = !in_quotes;
-            if (!in_quotes) {
-                *p = '\0';
-                tokens[position++] = strdup(start);
-                start = p + 1;
-            } else {
-                start = p + 1;
-            }
-        } else if (!in_quotes && strchr(DELIMITERS, *p)) {
-            *p = '\0';
-            if (start != p) {
-                tokens[position++] = start;
-            }
-            start = p + 1;
-        }
-    }
-
-    if (start != line + strlen(line)) {
-        tokens[position++] = start;
-    }
-
-    tokens[position] = NULL;
-    return tokens;
-}
-
-
 
 void handle_io_redirection(char** args, int* in_fd, int* out_fd) {
     for (int i = 0; args[i] != NULL; i++) {
         if (strcmp(args[i], "<") == 0 && args[i + 1] != NULL) {
             *in_fd = open(args[i + 1], O_RDONLY);
             if (*in_fd == -1) {
-                printf("\nError opening input file '%s': %s\n", 
-                       args[i + 1], strerror(errno));
-                return;
+                printw("\nError opening input file: %s\n", strerror(errno));
+                refresh();
             }
-            // Mark these arguments for removal
-            args[i] = NULL;
-            args[i + 1] = NULL;
-            i++;  // Skip the filename
-        } else if (strcmp(args[i], ">") == 0 && args[i + 1] != NULL) {
-            *out_fd = open(args[i + 1], 
-                          O_WRONLY | O_CREAT | O_TRUNC, 
-                          0644);
+            args[i] = NULL;  // Remove redirection from arguments
+        }
+        else if (strcmp(args[i], ">") == 0 && args[i + 1] != NULL) {
+            *out_fd = open(args[i + 1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (*out_fd == -1) {
-                printf("\nError opening output file '%s': %s\n", 
-                       args[i + 1], strerror(errno));
-                return;
+                printw("\nError opening output file: %s\n", strerror(errno));
+                refresh();
             }
-            // Mark these arguments for removal
-            args[i] = NULL;
-            args[i + 1] = NULL;
-            i++;  // Skip the filename
+            args[i] = NULL;  // Remove redirection from arguments
         }
     }
 }
 
-// Modified execute_external_command to handle I/O redirection and print output in a new line
+void redraw_prompt(ShellState* state) {
+    move(state->current_line, 0);
+    clrtoeol();
+    char* cwd = get_formatted_cwd();
+    int prompt_len = strlen(SHELL);
+    int cwd_len = strlen(cwd);
+    
+    // Print prompt and current directory with fixed spacing
+    printw("%s%s  ", SHELL, cwd);  // Two spaces after cwd
+    
+    // Print user input
+    if (state->current_cmd.count > 0) {
+        printw("%.*s", (int)state->current_cmd.count, state->current_cmd.data);
+    }
+    
+    // Calculate cursor position including the fixed spaces
+    int base_pos = prompt_len + cwd_len + 2;  // +2 for the two spaces after cwd
+    move(state->current_line, base_pos + state->cursor_pos);
+    refresh();
+}
 
-int execute_external_command(char** args, int in_fd, int out_fd) {
+
+void clear_screen_keep_prompt(ShellState* state) {
+    clear();
+    move(0, 0);
+    redraw_prompt(state);
+}
+
+char* get_formatted_cwd(void) {
+    static char formatted[PATH_MAX];
+    char cwd[PATH_MAX];
+    char* home = getenv("HOME");
+    
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+        return "[ERROR]";
+    }
+    
+    if (home && strncmp(cwd, home, strlen(home)) == 0) {
+        snprintf(formatted, sizeof(formatted), "~%s", cwd + strlen(home));
+    } else {
+        strncpy(formatted, cwd, sizeof(formatted) - 1);
+    }
+    
+    return formatted;
+}
+
+int execute_command(char** args) {
+    pid_t parent_pid = getpid();
     pid_t pid = fork();
-
+    int in_fd = STDIN_FILENO;
+    int out_fd = STDOUT_FILENO;
+    
+    handle_io_redirection(args, &in_fd, &out_fd);
+    
     if (pid == 0) {
         // Child process
-        // Move cursor to new line before executing command
-        printf("\n");
-        fflush(stdout);
+        pid_t child_pid = getpid();
+        printw("\n[%s] Child process created - Parent PID: %d, Child PID: %d, Command: %s\n", 
+               get_timestamp(), parent_pid, child_pid, args[0]);
+
+        refresh();
         
+        // Add sleep to give time to check process tree
+        sleep(700);  // Sleep for 700 seconds before executing command
+       
         if (in_fd != STDIN_FILENO) {
             dup2(in_fd, STDIN_FILENO);
             close(in_fd);
@@ -391,201 +470,238 @@ int execute_external_command(char** args, int in_fd, int out_fd) {
             dup2(out_fd, STDOUT_FILENO);
             close(out_fd);
         }
-
+        
         if (execvp(args[0], args) == -1) {
-            printf("Command execution failed: %s\n", strerror(errno));
+            printw("\nCommand execution failed: %s\n", strerror(errno));
+            refresh();
             exit(EXIT_FAILURE);
         }
     } else if (pid < 0) {
-        mvprintw(0, 0, "Fork failed: %s\n", strerror(errno));
+        printw("\nFork failed: %s\n", strerror(errno));
         refresh();
         return 0;
     } else {
         // Parent process
+        printw("\n[%s] Parent process waiting - PID: %d, Child PID: %d\n", 
+               get_timestamp(), parent_pid, pid);
+        refresh();
+
+        if (in_fd != STDIN_FILENO) close(in_fd);
+        if (out_fd != STDOUT_FILENO) close(out_fd);
+        
         int status;
         do {
             waitpid(pid, &status, WUNTRACED);
         } while (!WIFEXITED(status) && !WIFSIGNALED(status));
 
-        // Print a new line after command execution
-        printf("\n");
-        fflush(stdout);
+        printw("\n[%s] Child process completed - PID: %d\n", get_timestamp(), pid);
+        refresh();
+   
     }
-
+    
     return 1;
 }
 
-// Updated handle_cd function to fix snprintf warning
 int handle_cd(char** args) {
-    char* home = getenv("HOME");
-    char* oldpwd = getenv("OLDPWD");
-    char current[PATH_MAX];
-    char resolved_path[PATH_MAX];
-    bool follow_symlinks = true;
-    int i = 1;
-
-    // Save current directory
-    if (getcwd(current, sizeof(current)) == NULL) {
-        mvprintw(0, 0, "cd: error getting current directory: %s\n", strerror(errno));
+    char* dir = args[1];
+    if (dir == NULL) {
+        dir = getenv("HOME");
+    }
+    
+    if (chdir(dir) != 0) {
+        printw("\ncd: %s: %s\n", dir, strerror(errno));
         refresh();
         return 1;
     }
-
-    // Parse options
-    while (args[i] != NULL && args[i][0] == '-') {
-        if (strcmp(args[i], "-P") == 0) {
-            follow_symlinks = false;
-        } else if (strcmp(args[i], "-L") == 0) {
-            follow_symlinks = true;
-        } else if (strcmp(args[i], "-") == 0) {
-            if (oldpwd) {
-                if (chdir(oldpwd) != 0) {
-                    mvprintw(0, 0, "cd: %s\n", strerror(errno));
-                    refresh();
-                } else {
-                    setenv("OLDPWD", current, 1);
-                    char* newpwd = getcwd(NULL, 0);
-                    setenv("PWD", newpwd, 1);
-                    free(newpwd);
-                }
-                return 1;
-            } else {
-                mvprintw(0, 0, "cd: OLDPWD not set\n");
-                refresh();
-                return 1;
-            }
-        }
-        i++;
-    }
-
-    // Handle no arguments or '~'
-    if (args[i] == NULL || strcmp(args[i], "~") == 0) {
-        if (home) {
-            if (chdir(home) != 0) {
-                mvprintw(0, 0, "cd: %s\n", strerror(errno));
-                refresh();
-            } else {
-                setenv("OLDPWD", current, 1);
-                char* newpwd = getcwd(NULL, 0);
-                setenv("PWD", newpwd, 1);
-                free(newpwd);
-            }
-        } else {
-            mvprintw(0, 0, "cd: HOME not set\n");
-            refresh();
-        }
-        return 1;
-    }
-
-    // Handle quoted paths and construct full path
-    char* dir = args[i];
-    char* unquoted_path = NULL;
     
-    // Remove quotes if present
-    if (dir[0] == '\'' && dir[strlen(dir) - 1] == '\'') {
-        unquoted_path = strdup(dir + 1);
-        unquoted_path[strlen(unquoted_path) - 1] = '\0';
-    } else {
-        unquoted_path = strdup(dir);
-    }
-
-    // Construct full path for relative paths
-    if (unquoted_path[0] != '/') {
-        if (snprintf(resolved_path, PATH_MAX, "%s/%s", current, unquoted_path) >= PATH_MAX) {
-            mvprintw(0, 0, "cd: path too long\n");
-            refresh();
-            free(unquoted_path);
-            return 1;
-        }
-    } else {
-        strncpy(resolved_path, unquoted_path, PATH_MAX - 1);
-        resolved_path[PATH_MAX - 1] = '\0';
-    }
-    
-    free(unquoted_path);
-
-    // Change directory
-    if (chdir(resolved_path) != 0) {
-        mvprintw(0, 0, "cd: %s: %s\n", resolved_path, strerror(errno));
-        refresh();
-    } else {
-        setenv("OLDPWD", current, 1);
-        char* newpwd = getcwd(NULL, 0);
-        setenv("PWD", newpwd, 1);
-        free(newpwd);
-    }
-
     return 1;
-}
-
-int handle_help(char** args) {
-    pid_t pid = fork();
-
-    if (pid == 0) {
-        // Child process
-        printf("\nAvailable Commands:\n");
-        printf("------------------\n");
-        printf("cd [directory] [-P]    : Change current directory\n");
-        printf("help                   : Display this help message\n");
-        printf("exit                   : Exit the shell\n");
-        printf("ls [directory]         : List directory contents\n");
-        printf("[command] < [input]    : Redirect input from file\n");
-        printf("[command] > [output]   : Redirect output to file\n");
-        printf("\nCustom executables in current directory are also supported.\n\n");
-        exit(EXIT_SUCCESS);
-    } else if (pid < 0) {
-        mvprintw(0, 0, "Fork failed: %s\n", strerror(errno));
-        refresh();
-        return 0;
-    } else {
-        // Parent process
-        int status;
-        do {
-            waitpid(pid, &status, WUNTRACED);
-        } while (!WIFEXITED(status) && !WIFSIGNALED(status));
-    }
-
-    return 1;
-}
-
-int shell_exit(char** args) {
-    return 0;
-}
-
-void list_directory(char** args) {
-    pid_t pid = fork();
-
-    if (pid == 0) {
-        // Child process
-        char* ls_args[] = {"ls", args[1] ? args[1] : ".", NULL};
-        if (execvp(ls_args[0], ls_args) == -1) {
-            mvprintw(0, 0, "Command execution failed: %s\n", strerror(errno));
-            refresh();
-            exit(EXIT_FAILURE);
-        }
-    } else if (pid < 0) {
-        mvprintw(0, 0, "Fork failed: %s\n", strerror(errno));
-        refresh();
-        return;
-    } else {
-        // Parent process
-        int status;
-        do {
-            waitpid(pid, &status, WUNTRACED);
-        } while (!WIFEXITED(status) && !WIFSIGNALED(status));
-    }
 }
 
 void shell_initialize(void) {
+    setlocale(LC_ALL, "");
     initscr();
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
-    scrollok(stdscr, TRUE);  // Enable scrolling
+    scrollok(stdscr, TRUE);
+
+    // Add initial PID information
+    pid_t shell_pid = getpid();
+    printw("Custom Shell started - PID: %d\n", shell_pid);
+    refresh();
 }
 
 void shell_terminate(void) {
     endwin();
+}
+
+char** parse_command(char* line) {
+    int bufsize = MAX_ARGS;
+    char** tokens = malloc(bufsize * sizeof(char*));
+    int position = 0;
+    char* token_start = line;
+    bool in_quotes = false;
+    char quote_char = '\0';
+
+    if (!tokens) {
+        printw("\nAllocation error\n");
+        refresh();
+        return NULL;
+    }
+
+    while (*token_start != '\0') {
+        // Skip leading whitespace
+        while (isspace(*token_start)) token_start++;
+        if (*token_start == '\0') break;
+
+        // Handle quoted strings
+        if (*token_start == '"' || *token_start == '\'') {
+            quote_char = *token_start;
+            token_start++;
+            char* quote_end = strchr(token_start, quote_char);
+            if (quote_end) {
+                *quote_end = '\0';
+                tokens[position++] = strdup(token_start);
+                token_start = quote_end + 1;
+                continue;
+            }
+        }
+
+        // Handle unquoted tokens
+        char* token_end = token_start;
+        while (*token_end && !isspace(*token_end)) token_end++;
+        
+        if (*token_end != '\0') {
+            *token_end = '\0';
+            tokens[position++] = strdup(token_start);
+            token_start = token_end + 1;
+        } else {
+            tokens[position++] = strdup(token_start);
+            break;
+        }
+
+        if (position >= bufsize) {
+            bufsize += MAX_ARGS;
+            char** new_tokens = realloc(tokens, bufsize * sizeof(char*));
+            if (!new_tokens) {
+                for (int i = 0; i < position; i++) {
+                    free(tokens[i]);
+                }
+                free(tokens);
+                printw("\nAllocation error\n");
+                refresh();
+                return NULL;
+            }
+            tokens = new_tokens;
+        }
+    }
+
+    tokens[position] = NULL;
+    return tokens;
+}
+
+void handle_search(int ch, ShellState* state) {
+    static int matched_pos = -1;
+    
+    switch (ch) {
+        case ctrl('r'):  // Another ctrl-r press
+            // If we have a current match, look for the next one
+            if (matched_pos >= 0) {
+                int found = 0;
+                for (int i = matched_pos - 1; i >= 0; i--) {
+                    if (strstr(state->history.data[i].data, state->search_term.data) != NULL) {
+                        matched_pos = i;
+                        string_clear(&state->current_cmd);
+                        for (size_t j = 0; j < state->history.data[i].count; j++) {
+                            string_append(&state->current_cmd, state->history.data[i].data[j]);
+                        }
+                        state->cursor_pos = state->current_cmd.count;
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found) {
+                    flash();  // Visual feedback that no more matches were found
+                }
+            }
+            break;
+            
+        case ctrl('c'):  // Cancel search
+        case 27:         // ESC key
+            state->searching = false;
+            string_clear(&state->search_term);
+            matched_pos = -1;
+            break;
+            
+        case ENTER:      // Accept the current selection
+            state->searching = false;
+            string_clear(&state->search_term);
+            matched_pos = -1;
+            break;
+            
+        case KEY_BACKSPACE:
+        case 127:
+            if (state->search_term.count > 0) {
+                state->search_term.count--;
+                state->search_term.data[state->search_term.count] = '\0';
+                
+                // Reset match position
+                matched_pos = -1;
+                
+                // Try to find a match with the updated search term
+                if (state->search_term.count > 0) {
+                    for (int i = state->history.count - 1; i >= 0; i--) {
+                        if (strstr(state->history.data[i].data, state->search_term.data) != NULL) {
+                            matched_pos = i;
+                            string_clear(&state->current_cmd);
+                            for (size_t j = 0; j < state->history.data[i].count; j++) {
+                                string_append(&state->current_cmd, state->history.data[i].data[j]);
+                            }
+                            state->cursor_pos = state->current_cmd.count;
+                            break;
+                        }
+                    }
+                }
+            }
+            break;
+            
+        default:
+            if (isprint(ch)) {
+                string_append(&state->search_term, ch);
+                state->search_term.data[state->search_term.count] = '\0';
+                
+                // Look for a match
+                matched_pos = -1;
+                for (int i = state->history.count - 1; i >= 0; i--) {
+                    if (strstr(state->history.data[i].data, state->search_term.data) != NULL) {
+                        matched_pos = i;
+                        string_clear(&state->current_cmd);
+                        for (size_t j = 0; j < state->history.data[i].count; j++) {
+                            string_append(&state->current_cmd, state->history.data[i].data[j]);
+                        }
+                        state->cursor_pos = state->current_cmd.count;
+                        break;
+                    }
+                }
+                
+                if (matched_pos == -1) {
+                    flash();  // Visual feedback that no match was found
+                }
+            }
+            break;
+    }
+    
+    // Update display
+    move(getcury(stdscr), 0);
+    clrtoeol();
+    if (state->searching) {
+        printw("(reverse-i-search)`%s': %s", 
+               state->search_term.data ? state->search_term.data : "", 
+               state->current_cmd.data ? state->current_cmd.data : "");
+    } else {
+        redraw_prompt(state);
+    }
+    refresh();
 }
 
 int main(void) {
